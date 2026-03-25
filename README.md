@@ -99,15 +99,3 @@ screen-recorder/
             └── 25/
                 └── 20260325_100000.mp4
 ```
-
----
-
-## ⚖️ 授權條款
-
-本專案採用 **MIT License** 授權。詳見 [LICENSE](LICENSE) 檔案。
-
----
-
-## 🤝 貢獻與反饋
-
-如有任何問題或功能建議，歡迎提交 [Issue](https://github.com/xuerowo/screen-recorder/issues) 或 Pull Request！
