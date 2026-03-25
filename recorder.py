@@ -449,8 +449,20 @@ class ScreenAudioRecorder:
                     try:
                         check_mic = sc.default_microphone()
                         check_speaker = sc.default_speaker()
-                        if check_mic.id != current_mic_id or check_speaker.id != current_speaker_id:
-                            safe_log("Default audio device changed! Attempting automatic reconnect...")
+                        
+                        # Check if threads are dead
+                        threads_dead = False
+                        if m_thread and not m_thread.is_alive():
+                            threads_dead = True
+                        if s_thread and not s_thread.is_alive():
+                            threads_dead = True
+                            
+                        if check_mic.id != current_mic_id or check_speaker.id != current_speaker_id or threads_dead:
+                            if threads_dead:
+                                safe_log("Audio capture thread died! Attempting automatic reconnect...")
+                            else:
+                                safe_log("Default audio device changed! Attempting automatic reconnect...")
+                                
                             # Force re-initialization
                             if mic:
                                 try: mic.__exit__(None, None, None)
