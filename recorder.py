@@ -232,6 +232,7 @@ class ScreenAudioRecorder:
         
         self.mux_lock = threading.Lock()
         self.start_event = threading.Event()
+        self.pause_lock = threading.Lock()  # Protects is_paused, pause_start_time, total_paused_duration
         
         # Track PTS
         self.v_pts = 0
@@ -239,6 +240,19 @@ class ScreenAudioRecorder:
         
         self.video_start_time = None
         
+    def get_elapsed_recording_time(self):
+        """
+        Thread-safe: returns wall-clock seconds of *active* recording time,
+        i.e. total elapsed minus all paused durations (including any ongoing pause).
+        """
+        if self.video_start_time is None:
+            return 0.0
+        with self.pause_lock:
+            paused = self.total_paused_duration
+            if self.is_paused and self.pause_start_time is not None:
+                paused += time.time() - self.pause_start_time
+        return time.time() - self.video_start_time - paused
+
     def record_video(self):
         global RUNNING
         comtypes.CoInitialize()
@@ -330,7 +344,9 @@ class ScreenAudioRecorder:
         
         try:
             while RUNNING:
-                if self.is_paused:
+                with self.pause_lock:
+                    currently_paused = self.is_paused
+                if currently_paused:
                     time.sleep(0.1)
                     continue
 
@@ -346,7 +362,7 @@ class ScreenAudioRecorder:
                 
                 frame = av.VideoFrame.from_ndarray(img_resized, format='rgb24')
                 
-                elapsed_since_start = time.time() - self.video_start_time - self.total_paused_duration
+                elapsed_since_start = self.get_elapsed_recording_time()
                 
                 expected_frame_index = int(elapsed_since_start * self.fps)
                 if expected_frame_index <= self.v_pts:
@@ -522,22 +538,25 @@ class ScreenAudioRecorder:
                     
                     total_idle_time = time.time() - self.last_activity_time
                     
-                    if total_idle_time > self.idle_threshold:
-                        if not self.is_paused:
-                            self.is_paused = True
-                            self.pause_start_time = time.time()
-                            safe_log(f"Auto-paused (Total Idle: {total_idle_time:.1f}s)")
-                            # Clear queues when pausing to avoid old data on resume
-                            while not mic_queue.empty(): mic_queue.get()
-                            while not sys_queue.empty(): sys_queue.get()
-                    else:
-                        if self.is_paused:
-                            self.total_paused_duration += time.time() - self.pause_start_time
-                            self.is_paused = False
-                            self.pause_start_time = None
-                            safe_log("Auto-resumed (Activity detected!)")
+                    with self.pause_lock:
+                        if total_idle_time > self.idle_threshold:
+                            if not self.is_paused:
+                                self.is_paused = True
+                                self.pause_start_time = time.time()
+                                safe_log(f"Auto-paused (Total Idle: {total_idle_time:.1f}s)")
+                                # Clear queues when pausing to avoid old data on resume
+                                while not mic_queue.empty(): mic_queue.get()
+                                while not sys_queue.empty(): sys_queue.get()
+                        else:
+                            if self.is_paused:
+                                self.total_paused_duration += time.time() - self.pause_start_time
+                                self.is_paused = False
+                                self.pause_start_time = None
+                                safe_log("Auto-resumed (Activity detected!)")
 
-                if self.is_paused:
+                with self.pause_lock:
+                    currently_paused = self.is_paused
+                if currently_paused:
                     time.sleep(0.1)
                     # Clear queues while paused to ensure we only have fresh data on resume
                     # We do this after the auto-pause logic has a chance to see current data
@@ -566,13 +585,14 @@ class ScreenAudioRecorder:
                     time.sleep(0.01)
                     continue
                     
-                elapsed_audio_time = time.time() - self.video_start_time - self.total_paused_duration
+                elapsed_audio_time = self.get_elapsed_recording_time()
                 expected_a_pts = int(elapsed_audio_time * self.sample_rate)
                 
-                # Check for drift more aggressively (50ms)
-                if abs(expected_a_pts - self.a_pts) > self.sample_rate * 0.05:
+                # Drift correction: threshold = 100ms (was 50ms; tighter threshold caused
+                # spurious corrections when total_paused_duration was momentarily stale)
+                if abs(expected_a_pts - self.a_pts) > self.sample_rate * 0.1:
                     if expected_a_pts > self.a_pts:
-                        # Audio behind: clear queue to drop old data
+                        # Audio behind: skip stale queued data to catch up
                         while not mic_queue.empty(): 
                             try: mic_queue.get_nowait()
                             except: break
@@ -581,10 +601,7 @@ class ScreenAudioRecorder:
                             except: break
                         self.a_pts = expected_a_pts
                     else:
-                        # Audio ahead: instead of dropping blocks (which caused silence), 
-                        # just don't jump self.a_pts. This allows wall clock to catch up
-                        # while still recording the sound. We accept a bit of "lead" here
-                        # to prevent the "no sound" issue.
+                        # Audio ahead: let wall clock catch up; keep recording sound.
                         pass
                 
                 frame.pts = self.a_pts
