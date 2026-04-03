@@ -72,15 +72,48 @@ import av
 from fractions import Fraction
 import winreg
 
-CONFIG_FILE = "config.json"
+# Enable DPI awareness (fixes cursor position and resolution issues on high-DPI displays)
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1) # 1 = Process_System_DPI_Aware
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 RUNNING = True
 shutdown_complete_event = threading.Event()
 
 def load_config():
+    default_config = {
+        "fps": 30, 
+        "resolution": {"width": 1920, "height": 1080}, 
+        "mic_volume": 1.0, 
+        "sys_volume": 1.0, 
+        "start_on_boot": True, 
+        "auto_pause": True, 
+        "idle_threshold": 5.0, 
+        "silence_threshold": 0.01
+    }
     if not os.path.exists(CONFIG_FILE):
-        return {"fps": 30, "resolution": {"width": 1920, "height": 1080}, "mic_volume": 1.0, "sys_volume": 1.0, "start_on_boot": True, "auto_pause": True, "idle_threshold": 5.0, "silence_threshold": 0.01}
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        safe_log(f"Config file not found at {CONFIG_FILE}, using defaults.")
+        return default_config
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            # Ensure all keys exist by merging with defaults
+            merged_config = default_config.copy()
+            for k, v in config.items():
+                if k == "resolution" and isinstance(v, dict):
+                    merged_config[k].update(v)
+                else:
+                    merged_config[k] = v
+            safe_log(f"Config loaded successfully: {merged_config['resolution']['width']}x{merged_config['resolution']['height']} @ {merged_config['fps']}fps")
+            return merged_config
+    except Exception as e:
+        safe_log(f"Error loading config: {e}. Using defaults.")
+        return default_config
 
 def setup_startup(enable):
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -126,7 +159,11 @@ def remux_mkv_to_mp4(mkv_path):
     import subprocess
     if shutil.which("ffmpeg"):
         try:
-            subprocess.run(["ffmpeg", "-y", "-i", mkv_path, "-c", "copy", mp4_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # We use subprocess.Popen to capture output and show a simple progress indicator
+            # or just let it show its own stats by not hiding stderr.
+            # But let's try to keep it clean.
+            cmd = ["ffmpeg", "-y", "-i", mkv_path, "-c", "copy", mp4_path, "-stats", "-loglevel", "info"]
+            subprocess.run(cmd, check=True)
             os.remove(mkv_path)
             safe_log(f"Remux completed successfully via ffmpeg: {mp4_path}")
             return
@@ -135,6 +172,7 @@ def remux_mkv_to_mp4(mkv_path):
             
     try:
         with av.open(mkv_path, 'r') as in_container:
+            duration = in_container.duration
             with av.open(mp4_path, 'w') as out_container:
                 out_streams = []
                 for in_stream in in_container.streams:
@@ -145,6 +183,7 @@ def remux_mkv_to_mp4(mkv_path):
                         out_stream.codec_context.codec_tag = 'mp4a'
                     out_streams.append(out_stream)
                 
+                last_reported_progress = -1
                 try:
                     for packet in in_container.demux():
                         if packet.pts is None:
@@ -153,11 +192,26 @@ def remux_mkv_to_mp4(mkv_path):
                             packet.dts = packet.pts
                         packet.stream = out_streams[packet.stream.index]
                         out_container.mux(packet)
+                        
+                        # Calculate and display progress
+                        if duration and duration > 0:
+                            current_time_sec = float(packet.pts * packet.stream.time_base)
+                            total_duration_sec = duration / 1000000.0
+                            progress = int((current_time_sec / total_duration_sec) * 100)
+                            if progress > last_reported_progress:
+                                sys.stdout.write(f"\r[LOG] Remuxing progress: {progress}%")
+                                sys.stdout.flush()
+                                last_reported_progress = progress
                 except (av.error.EOFError, av.error.InvalidDataError) as demux_err:
+                    print() # New line after progress
                     safe_log(f"Reached end of unfinalized MKV: {demux_err}")
                 except Exception as unexpected_err:
+                    print() # New line after progress
                     safe_log(f"Unexpected remux error: {unexpected_err}")
                     raise unexpected_err
+                
+                if last_reported_progress != -1:
+                    print() # New line after progress
                     
         os.remove(mkv_path)
         safe_log(f"Remux completed successfully: {mp4_path}")
