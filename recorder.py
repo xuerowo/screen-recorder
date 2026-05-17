@@ -82,8 +82,10 @@ except Exception:
         pass
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recorder.log")
 RUNNING = True
 shutdown_complete_event = threading.Event()
+single_instance_mutex = None
 
 def load_config():
     default_config = {
@@ -115,14 +117,34 @@ def load_config():
         safe_log(f"Error loading config: {e}. Using defaults.")
         return default_config
 
+def quote_windows_arg(value):
+    escaped_value = str(value).replace('"', r'\"')
+    return f'"{escaped_value}"'
+
+def get_startup_command():
+    cmd_path = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
+    if getattr(sys, "frozen", False):
+        app_command = quote_windows_arg(os.path.abspath(sys.executable))
+        return f'{quote_windows_arg(cmd_path)} /k "{app_command}"'
+
+    python_path = sys.executable
+    if os.path.basename(python_path).lower() == "pythonw.exe":
+        python_console_path = os.path.join(os.path.dirname(python_path), "python.exe")
+        if os.path.exists(python_console_path):
+            python_path = python_console_path
+
+    script_path = os.path.abspath(__file__)
+    app_command = f"{quote_windows_arg(python_path)} {quote_windows_arg(script_path)}"
+    return f'{quote_windows_arg(cmd_path)} /k "{app_command}"'
+
 def setup_startup(enable):
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     app_name = "AutoScreenRecorder"
-    exe_path = os.path.abspath(sys.argv[0])
+    startup_command = get_startup_command()
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
         if enable:
-            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, startup_command)
         else:
             try:
                 winreg.DeleteValue(key, app_name)
@@ -131,6 +153,23 @@ def setup_startup(enable):
         winreg.CloseKey(key)
     except Exception as e:
         print(f"Failed to configure startup: {e}")
+
+def acquire_single_instance_lock():
+    global single_instance_mutex
+    mutex_name = r"Local\AutoScreenRecorder"
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+    kernel32.GetLastError.restype = ctypes.wintypes.DWORD
+
+    single_instance_mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    if not single_instance_mutex:
+        safe_log("Failed to create single-instance lock.")
+        return True
+    if kernel32.GetLastError() == 183:
+        safe_log("Another recorder instance is already running. Exiting.")
+        return False
+    return True
 
 def safe_print(*args, **kwargs):
     try:
@@ -141,7 +180,13 @@ def safe_print(*args, **kwargs):
 
 def safe_log(message):
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    safe_print(f"[{now}] [LOG] {message}")
+    line = f"[{now}] [LOG] {message}"
+    safe_print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(line + "\n")
+    except Exception:
+        pass
 
 def get_output_filepath(ext=".mkv"):
     now = datetime.datetime.now()
@@ -707,6 +752,8 @@ class ScreenAudioRecorder:
 def main():
     config = load_config()
     setup_startup(config.get("start_on_boot", True))
+    if not acquire_single_instance_lock():
+        return
     process_unfinalized_recordings()
     
     signal.signal(signal.SIGINT, graceful_shutdown)
@@ -744,4 +791,10 @@ def main():
         remux_mkv_to_mp4(recorder.output_file)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        safe_log("Fatal error:")
+        safe_log(traceback.format_exc())
+        raise

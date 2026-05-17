@@ -1,6 +1,7 @@
 # Project specific
 Recordings/
 config.json
+recorder.log
 
 # Python
 __pycache__/
