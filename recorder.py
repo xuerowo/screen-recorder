@@ -490,6 +490,21 @@ class ScreenAudioRecorder:
         block_size = 2048
         mic_queue = Queue(maxsize=5)
         sys_queue = Queue(maxsize=5)
+        zero_audio_block = np.zeros((block_size, 2), dtype=np.float32)
+        audio_issue_log_times = {}
+
+        def log_audio_issue(key, message, min_interval=10.0):
+            now = time.time()
+            if now - audio_issue_log_times.get(key, 0) >= min_interval:
+                audio_issue_log_times[key] = now
+                safe_log(message)
+
+        def close_recorder(recorder):
+            if recorder:
+                try:
+                    recorder.__exit__(None, None, None)
+                except:
+                    pass
         
         def mic_capture_thread(mic, block_size, queue):
             while RUNNING:
@@ -519,22 +534,43 @@ class ScreenAudioRecorder:
                     break
 
         def get_recorders():
+            mic = None
+            sys_audio = None
+            mic_id = None
+            speaker_id = None
+            mic_name = "unavailable"
+            speaker_name = "unavailable"
+
+            if self.mic_vol > 0:
+                try:
+                    default_mic = sc.default_microphone()
+                    mic = default_mic.recorder(samplerate=self.sample_rate)
+                    mic.__enter__()
+                    mic_id = default_mic.id
+                    mic_name = default_mic.name
+                except Exception as e:
+                    close_recorder(mic)
+                    mic = None
+                    log_audio_issue("mic_open", f"Microphone unavailable; recording without microphone: {e}")
+            else:
+                mic_name = "disabled"
+
             try:
-                default_mic = sc.default_microphone()
                 default_speaker = sc.default_speaker()
                 loopback_mic = sc.get_microphone(id=default_speaker.id, include_loopback=True)
-                
-                mic = default_mic.recorder(samplerate=self.sample_rate)
                 sys_audio = loopback_mic.recorder(samplerate=self.sample_rate)
-                
-                mic.__enter__()
                 sys_audio.__enter__()
-                
-                safe_log(f"Audio devices connected - Mic: {default_mic.name}, Speaker: {default_speaker.name}")
-                return mic, sys_audio, default_mic.id, default_speaker.id
+                speaker_id = default_speaker.id
+                speaker_name = default_speaker.name
             except Exception as e:
-                safe_log(f"Failed to open audio devices: {e}")
-                return None, None, None, None
+                close_recorder(sys_audio)
+                sys_audio = None
+                log_audio_issue("speaker_open", f"System audio unavailable; recording without system audio: {e}")
+
+            if mic or sys_audio:
+                safe_log(f"Audio devices connected - Mic: {mic_name}, Speaker: {speaker_name}")
+
+            return mic, sys_audio, mic_id, speaker_id
 
         def get_idle_time():
             try:
@@ -543,14 +579,39 @@ class ScreenAudioRecorder:
                 return 0
 
         mic, sys_audio, current_mic_id, current_speaker_id = get_recorders()
-        
+
         m_thread = None
         s_thread = None
-        if mic and sys_audio:
-            m_thread = threading.Thread(target=mic_capture_thread, args=(mic, block_size, mic_queue), daemon=True)
-            s_thread = threading.Thread(target=sys_capture_thread, args=(sys_audio, block_size, sys_queue), daemon=True)
-            m_thread.start()
-            s_thread.start()
+
+        def start_capture_threads(mic_recorder, sys_recorder):
+            nonlocal m_thread, s_thread
+            if mic_recorder:
+                m_thread = threading.Thread(target=mic_capture_thread, args=(mic_recorder, block_size, mic_queue), daemon=True)
+                m_thread.start()
+            else:
+                m_thread = None
+            if sys_recorder:
+                s_thread = threading.Thread(target=sys_capture_thread, args=(sys_recorder, block_size, sys_queue), daemon=True)
+                s_thread.start()
+            else:
+                s_thread = None
+
+        def join_capture_threads(timeout=0.2):
+            nonlocal m_thread, s_thread
+            for capture_thread in (m_thread, s_thread):
+                if capture_thread and capture_thread.is_alive():
+                    capture_thread.join(timeout=timeout)
+            m_thread = None
+            s_thread = None
+
+        if mic or sys_audio:
+            start_capture_threads(mic, sys_audio)
+
+        if not mic and not sys_audio:
+            safe_log("No audio devices available; recording silent audio until a device is available.")
+
+        last_had_audio = bool(mic or sys_audio)
+        last_no_audio_retry_time = time.time()
 
         last_device_check_time = time.time()
 
@@ -562,8 +623,20 @@ class ScreenAudioRecorder:
                 if current_time - last_device_check_time > 2.0:
                     last_device_check_time = current_time
                     try:
-                        check_mic = sc.default_microphone()
-                        check_speaker = sc.default_speaker()
+                        check_mic_id = None
+                        check_speaker_id = None
+                        if self.mic_vol > 0:
+                            try:
+                                check_mic = sc.default_microphone()
+                                check_mic_id = check_mic.id
+                            except Exception:
+                                pass
+
+                        try:
+                            check_speaker = sc.default_speaker()
+                            check_speaker_id = check_speaker.id
+                        except Exception as e:
+                            log_audio_issue("speaker_check", f"System audio still unavailable: {e}")
                         
                         # Check if threads are dead
                         threads_dead = False
@@ -572,21 +645,18 @@ class ScreenAudioRecorder:
                         if s_thread and not s_thread.is_alive():
                             threads_dead = True
                             
-                        if check_mic.id != current_mic_id or check_speaker.id != current_speaker_id or threads_dead:
+                        if check_mic_id != current_mic_id or check_speaker_id != current_speaker_id or threads_dead:
                             if threads_dead:
                                 safe_log("Audio capture thread died! Attempting automatic reconnect...")
                             else:
                                 safe_log("Default audio device changed! Attempting automatic reconnect...")
                                 
                             # Force re-initialization
-                            if mic:
-                                try: mic.__exit__(None, None, None)
-                                except: pass
-                                mic = None
-                            if sys_audio:
-                                try: sys_audio.__exit__(None, None, None)
-                                except: pass
-                                sys_audio = None
+                            close_recorder(mic)
+                            mic = None
+                            close_recorder(sys_audio)
+                            sys_audio = None
+                            join_capture_threads()
                             # Clear queues
                             while not mic_queue.empty(): 
                                 try: mic_queue.get_nowait()
@@ -594,37 +664,59 @@ class ScreenAudioRecorder:
                             while not sys_queue.empty(): 
                                 try: sys_queue.get_nowait()
                                 except Empty: break
+
+                            mic, sys_audio, current_mic_id, current_speaker_id = get_recorders()
+                            start_capture_threads(mic, sys_audio)
                     except Exception as e:
                         safe_log(f"Error checking audio devices: {e}")
 
-                if not mic or not sys_audio:
-                    time.sleep(0.5)
-                    mic, sys_audio, current_mic_id, current_speaker_id = get_recorders()
-                    if mic and sys_audio:
-                        m_thread = threading.Thread(target=mic_capture_thread, args=(mic, block_size, mic_queue), daemon=True)
-                        s_thread = threading.Thread(target=sys_capture_thread, args=(sys_audio, block_size, sys_queue), daemon=True)
-                        m_thread.start()
-                        s_thread.start()
-                    else:
-                        # Fallback to silence if still no devices
-                        mic_data = np.zeros((block_size, 2), dtype=np.float32)
-                        sys_data = np.zeros((block_size, 2), dtype=np.float32)
+                if not mic and not sys_audio:
+                    time.sleep(block_size / self.sample_rate)
+                    if time.time() - last_no_audio_retry_time >= 2.0:
+                        last_no_audio_retry_time = time.time()
+                        mic, sys_audio, current_mic_id, current_speaker_id = get_recorders()
+                        if mic or sys_audio:
+                            start_capture_threads(mic, sys_audio)
+                    mic_data = zero_audio_block
+                    sys_data = zero_audio_block
                 else:
                     # Get data from queues
-                    try:
-                        sys_data = sys_queue.get(timeout=0.1)
-                        if self.mic_vol > 0:
-                            try:
-                                mic_data = mic_queue.get(timeout=0.05)
-                            except Empty:
-                                mic_data = np.zeros_like(sys_data)
-                        else:
-                            mic_data = np.zeros_like(sys_data)
-                    except Empty:
-                        if self.is_paused:
-                            time.sleep(0.1)
+                    sys_data = None
+                    mic_data = None
+
+                    if sys_audio:
+                        try:
+                            sys_data = sys_queue.get(timeout=0.1)
+                        except Empty:
+                            if self.is_paused:
+                                time.sleep(0.1)
+                                continue
                             continue
-                        continue
+                    if mic and self.mic_vol > 0:
+                        try:
+                            mic_data = mic_queue.get(timeout=0.05)
+                        except Empty:
+                            if not sys_audio:
+                                if self.is_paused:
+                                    time.sleep(0.1)
+                                    continue
+                                continue
+
+                    if sys_data is None:
+                        if mic_data is not None:
+                            sys_data = np.zeros_like(mic_data)
+                        else:
+                            sys_data = zero_audio_block
+                    if mic_data is None:
+                        mic_data = np.zeros_like(sys_data)
+
+                has_audio = bool(mic or sys_audio)
+                if has_audio != last_had_audio:
+                    if has_audio:
+                        safe_log("Audio device available again; resuming live audio capture.")
+                    else:
+                        safe_log("All audio devices unavailable; recording silent audio.")
+                    last_had_audio = has_audio
 
                 # Auto-pause logic
                 if self.auto_pause:
@@ -725,12 +817,9 @@ class ScreenAudioRecorder:
             traceback.print_exc()
             safe_log(f"Major audio thread error: {e}")
         finally:
-            if mic:
-                try: mic.__exit__(None, None, None)
-                except: pass
-            if sys_audio:
-                try: sys_audio.__exit__(None, None, None)
-                except: pass
+            close_recorder(mic)
+            close_recorder(sys_audio)
+            join_capture_threads()
 
     def finalize(self):
         with self.mux_lock:
