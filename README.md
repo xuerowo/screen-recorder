@@ -21,6 +21,7 @@
 *   **📂 自動化歸檔**：
     *   依照 `Recordings/YYYY/MM/DD/YYYYMMDD_HHMMSS.mp4` 結構自動分類。
     *   支援**優雅關閉 (Graceful Shutdown)**，確保程式意外中斷時影片仍能正確保存。
+*   **🧹 自動清理舊錄影**：可設定只保留最近 N 天的錄影，超過期限的檔案會自動刪除，並清掉變空的日期資料夾。
 *   **🖱️ 完整滑鼠擷取**：自動將系統滑鼠游標精確渲染至影片畫面中。
 *   **🔄 安全錄製機制**：
     *   預設先錄製為 `.mkv` 格式（防止當機導致檔案毀損）。
@@ -70,7 +71,8 @@
     "start_on_boot": true,
     "auto_pause": true,
     "idle_threshold": 5.0,
-    "silence_threshold": 0.01
+    "silence_threshold": 0.01,
+    "retention_days": 0
 }
 ```
 
@@ -81,6 +83,26 @@
 *   **auto_pause**: 是否開啟自動暫停功能。
 *   **idle_threshold**: 判斷閒置的秒數門檻。
 *   **silence_threshold**: 判斷靜音的音量門檻。
+*   **retention_days**: 錄影保留天數。設為 `0` 表示永久保留（預設）；設為 `30` 表示只保留最近 30 天的錄影。
+
+---
+
+## 🧹 錄影保留天數 (`retention_days`)
+
+想要自動清掉舊錄影，只要把 `config.json` 的 `retention_days` 改成大於 `0` 的數字即可：
+
+```json
+{
+    "retention_days": 30
+}
+```
+
+*   程式每次啟動時會檢查一次，之後**每 6 小時**再檢查一次，因此長時間連續錄影也會定期清理。
+*   檔案的錄影日期取自檔名 `YYYYMMDD_HHMMSS`；若檔名不符合格式，則改用檔案的修改時間判斷。
+*   只有 `Recordings/` 資料夾內的 `.mp4` / `.mkv` 會被刪除，正在錄製中的檔案一定會被保留，其他檔案與資料夾不受影響。
+*   刪除後若 `Recordings/YYYY/MM/DD/` 變成空資料夾，會一併移除。
+*   每次清理結果都會寫入 `recorder.log`，例如 `Retention cleanup: removed 3 recording(s) older than 30 day(s), freed 1234.5 MB.`。
+*   設為 `0` 或負數即停用此功能（不會刪除任何檔案）。
 
 ---
 

@@ -83,6 +83,7 @@ except Exception:
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recorder.log")
+RETENTION_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 RUNNING = True
 shutdown_complete_event = threading.Event()
 single_instance_mutex = None
@@ -96,7 +97,8 @@ def load_config():
         "start_on_boot": True, 
         "auto_pause": True, 
         "idle_threshold": 5.0, 
-        "silence_threshold": 0.01
+        "silence_threshold": 0.01,
+        "retention_days": 0
     }
     if not os.path.exists(CONFIG_FILE):
         safe_log(f"Config file not found at {CONFIG_FILE}, using defaults.")
@@ -280,6 +282,114 @@ def process_unfinalized_recordings():
                     remux_mkv_to_mp4(mkv_path)
                 except Exception as e:
                     safe_log(f"Error processing {mkv_path}: {e}")
+
+def parse_recording_timestamp(file_path):
+    """
+    Returns the recording start time encoded in a recording file name
+    (YYYYMMDD_HHMMSS.mp4), or None when the name does not follow that pattern.
+    """
+    try:
+        return datetime.datetime.strptime(Path(file_path).stem, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def get_retention_days(config):
+    """
+    Returns the retention window in days. 0 (or any invalid/non-positive value)
+    means "keep recordings forever", which is also the safe default.
+    """
+    raw_value = config.get("retention_days", 0)
+    if isinstance(raw_value, bool):
+        return 0
+    try:
+        days = float(raw_value)
+    except (TypeError, ValueError):
+        return 0
+    return days if days > 0 else 0
+
+
+def cleanup_old_recordings(config, exclude_paths=None, recordings_dir=None):
+    """
+    Deletes recordings older than config["retention_days"] and prunes the
+    date folders that become empty. Returns the number of deleted files.
+
+    Files are dated by the timestamp in their name, falling back to the
+    modification time when the name does not match the expected pattern.
+    Only .mp4/.mkv files inside the Recordings folder are ever touched, and
+    files listed in exclude_paths (e.g. the recording in progress) are skipped.
+    """
+    retention_days = get_retention_days(config)
+    if retention_days <= 0:
+        return 0
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if recordings_dir is None:
+        recordings_dir = os.path.join(base_dir, "Recordings")
+    recordings_dir = os.path.abspath(recordings_dir)
+    if not os.path.isdir(recordings_dir):
+        return 0
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=retention_days)
+    excluded = {
+        os.path.normcase(os.path.abspath(str(path)))
+        for path in (exclude_paths or [])
+        if path
+    }
+
+    deleted_count = 0
+    freed_bytes = 0
+    failed_count = 0
+
+    for root, _, files in os.walk(recordings_dir, topdown=False):
+        for file_name in files:
+            if not file_name.lower().endswith((".mp4", ".mkv")):
+                continue
+
+            file_path = os.path.join(root, file_name)
+            if os.path.normcase(os.path.abspath(file_path)) in excluded:
+                continue
+
+            recorded_at = parse_recording_timestamp(file_path)
+            if recorded_at is None:
+                try:
+                    recorded_at = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+                except OSError:
+                    continue
+
+            if recorded_at >= cutoff:
+                continue
+
+            try:
+                file_size = os.path.getsize(file_path)
+                os.remove(file_path)
+                deleted_count += 1
+                freed_bytes += file_size
+            except OSError as e:
+                failed_count += 1
+                safe_log(f"Retention cleanup could not delete {file_path}: {e}")
+
+        # Prune date folders that are now empty (bottom-up, so nested folders die first).
+        if os.path.normcase(root) == os.path.normcase(recordings_dir):
+            continue
+        try:
+            if not os.listdir(root):
+                os.rmdir(root)
+        except OSError:
+            pass
+
+    if deleted_count or failed_count:
+        freed_mb = freed_bytes / (1024 * 1024)
+        summary = (f"Retention cleanup: removed {deleted_count} recording(s) older than "
+                   f"{retention_days:g} day(s), freed {freed_mb:.1f} MB.")
+        if failed_count:
+            summary += f" {failed_count} file(s) could not be deleted (in use?)."
+        safe_log(summary)
+    else:
+        safe_log(f"Retention cleanup: no recordings older than {retention_days:g} day(s).")
+
+    return deleted_count
+
 
 def graceful_shutdown(*args, **kwargs):
     global RUNNING
@@ -856,15 +966,26 @@ def main():
         
     print("Starting screen recording... Press Ctrl+C to stop.")
     recorder = ScreenAudioRecorder(config)
-    
+
+    retention_days = get_retention_days(config)
+    if retention_days > 0:
+        safe_log(f"Retention policy enabled: only recordings from the last {retention_days:g} day(s) are kept.")
+    else:
+        safe_log("Retention policy disabled (retention_days = 0): all recordings are kept.")
+    cleanup_old_recordings(config, exclude_paths=[recorder.output_file])
+
     v_thread = threading.Thread(target=recorder.record_video)
     a_thread = threading.Thread(target=recorder.record_audio)
     
     v_thread.start()
     a_thread.start()
     
+    last_cleanup_time = time.monotonic()
     while RUNNING:
         time.sleep(0.2)
+        if retention_days > 0 and time.monotonic() - last_cleanup_time >= RETENTION_CHECK_INTERVAL_SECONDS:
+            last_cleanup_time = time.monotonic()
+            cleanup_old_recordings(config, exclude_paths=[recorder.output_file])
         
     v_thread.join(timeout=1.5)
     a_thread.join(timeout=1.5)
