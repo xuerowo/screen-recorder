@@ -44,8 +44,356 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER),
                 ("bmiColors", ctypes.wintypes.DWORD * 3)]
 
+class BITMAP(ctypes.Structure):
+    _fields_ = [("bmType", ctypes.c_long),
+                ("bmWidth", ctypes.c_long),
+                ("bmHeight", ctypes.c_long),
+                ("bmWidthBytes", ctypes.c_long),
+                ("bmPlanes", ctypes.wintypes.WORD),
+                ("bmBitsPixel", ctypes.wintypes.WORD),
+                ("bmBits", ctypes.c_void_p)]
+
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
+gdi32.GetObjectW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+
+try:
+    # Undocumented but present since Windows XP; used to read animated cursor frames.
+    _GetCursorFrameInfo = user32.GetCursorFrameInfo
+    _GetCursorFrameInfo.restype = ctypes.c_void_p
+    _GetCursorFrameInfo.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
+                                    ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.POINTER(ctypes.wintypes.DWORD)]
+except AttributeError:
+    _GetCursorFrameInfo = None
+
+user32.LoadCursorW.restype = ctypes.c_void_p
+user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+user32.LoadImageW.restype = ctypes.c_void_p
+user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.DestroyCursor.argtypes = [ctypes.c_void_p]
+
+# System cursor IDs and their value names under HKCU\Control Panel\Cursors.
+SYSTEM_CURSOR_NAMES = {
+    32512: "Arrow", 32513: "IBeam", 32514: "Wait", 32515: "Crosshair", 32516: "UpArrow",
+    32631: "NWPen", 32642: "SizeNWSE", 32643: "SizeNESW", 32644: "SizeWE", 32645: "SizeNS",
+    32646: "SizeAll", 32648: "No", 32649: "Hand", 32650: "AppStarting", 32651: "Help",
+    32671: "Pin", 32672: "Person",
+}
+
+class CursorOverlay:
+    """
+    Draws the mouse cursor onto captured frames.
+
+    Rendering a cursor through GDI is expensive, so each cursor frame is cached
+    per cursor handle and refreshed every CACHE_TTL seconds (system cursors keep
+    their handle when the cursor scheme/size changes).
+
+    Cursors come in two kinds, reproduced the same way DrawIconEx does:
+    - alpha cursors (32bpp with an alpha channel) are alpha-blended;
+    - classic cursors are applied as (screen AND mask) XOR image, which also
+      covers inverting pixels (e.g. the classic I-beam).
+    Animated cursors (busy spinners, .ani files) are played at their own frame rate.
+
+    Windows shows system cursors at "pointer size" (CursorBaseSize) x display
+    scale, while the cursor handle only holds a bitmap at the default size. So
+    system cursors are reloaded from the cursor scheme's file at the displayed
+    size (or stretched when the scheme has no file).
+    """
+    MIN_SIZE = 128
+    CACHE_TTL = 1.0
+    MAX_CACHE_ENTRIES = 256
+    JIFFY = 1.0 / 60
+
+    def __init__(self):
+        self._cache = {}
+        self._frame_timing = {}
+        self._system_cursors = None # (timestamp, displayed size, {handle: (file path or None, bitmap size)})
+        self._scaled_cursors = {} # system handle -> (file path, size, loaded handle)
+
+    def close(self):
+        for _, _, handle in self._scaled_cursors.values():
+            user32.DestroyCursor(handle)
+        self._scaled_cursors.clear()
+        self._cache.clear()
+        self._frame_timing.clear()
+
+    @staticmethod
+    def _displayed_cursor_size():
+        base_size = 32
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Cursors") as key:
+                value, _ = winreg.QueryValueEx(key, "CursorBaseSize")
+                if isinstance(value, int) and 16 <= value <= 512:
+                    base_size = value
+        except OSError:
+            pass
+        try:
+            dpi = user32.GetDpiForSystem()
+        except AttributeError:
+            dpi = 96
+        return max(1, round(base_size * (dpi or 96) / 96))
+
+    def _get_system_cursors(self, now):
+        state = self._system_cursors
+        if state is not None and now - state[0] <= self.CACHE_TTL:
+            return state[1], state[2]
+
+        paths = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Cursors") as key:
+                for name in SYSTEM_CURSOR_NAMES.values():
+                    try:
+                        value, _ = winreg.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    if isinstance(value, str) and value:
+                        path = os.path.expandvars(value)
+                        if os.path.isfile(path):
+                            paths[name] = path
+        except OSError:
+            pass
+
+        handles = {}
+        hdc = win32gui.GetDC(0)
+        try:
+            for cursor_id, name in SYSTEM_CURSOR_NAMES.items():
+                handle = user32.LoadCursorW(None, ctypes.c_void_p(cursor_id))
+                if handle:
+                    _, _, width, height, _ = self._read_icon_info(hdc, handle)
+                    handles[handle] = (paths.get(name), max(width, height))
+        finally:
+            win32gui.ReleaseDC(0, hdc)
+
+        size = self._displayed_cursor_size()
+        self._system_cursors = (now, size, handles)
+        return size, handles
+
+    def _resolve_render_source(self, hcursor, now):
+        """
+        Returns (handle to render, forced draw size or 0). Cursors that are not
+        system cursors, or are already at the displayed size, are drawn as-is.
+        """
+        size, handles = self._get_system_cursors(now)
+        source = handles.get(hcursor)
+        if source is None:
+            return hcursor, 0
+        path, bitmap_size = source
+        if bitmap_size == size:
+            return hcursor, 0
+        if path is None:
+            return hcursor, size
+
+        scaled = self._scaled_cursors.get(hcursor)
+        if scaled is None or scaled[0] != path or scaled[1] != size:
+            if scaled is not None:
+                user32.DestroyCursor(scaled[2])
+                del self._scaled_cursors[hcursor]
+                # The destroyed handle value may be reused, so drop anything rendered from it.
+                self._cache.clear()
+                self._frame_timing.clear()
+            loaded = user32.LoadImageW(None, path, 2, size, size, 0x10) # IMAGE_CURSOR, LR_LOADFROMFILE
+            if not loaded:
+                return hcursor, size
+            scaled = (path, size, loaded)
+            self._scaled_cursors[hcursor] = scaled
+        return scaled[2], 0
+
+    @staticmethod
+    def _bitmap_info(hbitmap):
+        bm = BITMAP()
+        if not gdi32.GetObjectW(ctypes.c_void_p(hbitmap), ctypes.sizeof(BITMAP), ctypes.byref(bm)):
+            return None
+        return bm
+
+    @staticmethod
+    def _dib_info(width, height):
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height # Top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        return bmi
+
+    def _read_icon_info(self, hdc, hcursor):
+        """Returns (hotspot_x, hotspot_y, width, height, has_alpha)."""
+        icon_info = ICONINFO()
+        if not user32.GetIconInfo(ctypes.c_void_p(hcursor), ctypes.byref(icon_info)):
+            return 0, 0, 0, 0, True
+        width = height = 0
+        has_alpha = False
+        try:
+            if icon_info.hbmColor:
+                bm = self._bitmap_info(icon_info.hbmColor)
+                if bm:
+                    width, height = bm.bmWidth, abs(bm.bmHeight)
+                    if bm.bmBitsPixel == 32 and width > 0 and height > 0:
+                        buffer = ctypes.create_string_buffer(width * height * 4)
+                        bmi = self._dib_info(width, height)
+                        if gdi32.GetDIBits(hdc, ctypes.c_void_p(icon_info.hbmColor), 0, height, buffer, ctypes.byref(bmi), 0):
+                            pixels = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))
+                            has_alpha = bool(pixels[..., 3].any())
+            elif icon_info.hbmMask:
+                # Monochrome cursor: the mask holds the AND and XOR bitmaps stacked vertically.
+                bm = self._bitmap_info(icon_info.hbmMask)
+                if bm:
+                    width, height = bm.bmWidth, abs(bm.bmHeight) // 2
+        finally:
+            if icon_info.hbmMask:
+                gdi32.DeleteObject(ctypes.c_void_p(icon_info.hbmMask))
+            if icon_info.hbmColor:
+                gdi32.DeleteObject(ctypes.c_void_p(icon_info.hbmColor))
+        return icon_info.xHotspot, icon_info.yHotspot, width, height, has_alpha
+
+    def _render_cursor(self, hcursor, step=0, draw_size=0):
+        hdc = win32gui.GetDC(0)
+        try:
+            hotspot_x, hotspot_y, width, height, has_alpha = self._read_icon_info(hdc, hcursor)
+            if draw_size and width and height:
+                hotspot_x = round(hotspot_x * draw_size / width)
+                hotspot_y = round(hotspot_y * draw_size / height)
+            size_x = size_y = max(self.MIN_SIZE, width, height, draw_size)
+            hdc_mem = win32gui.CreateCompatibleDC(hdc)
+            try:
+                hbitmap = win32gui.CreateCompatibleBitmap(hdc, size_x, size_y)
+                try:
+                    old_bmp = win32gui.SelectObject(hdc_mem, hbitmap)
+                    bmi = self._dib_info(size_x, size_y)
+
+                    def draw_on(stock_brush):
+                        win32gui.FillRect(hdc_mem, (0, 0, size_x, size_y), win32gui.GetStockObject(stock_brush))
+                        win32gui.DrawIconEx(hdc_mem, 0, 0, hcursor, draw_size, draw_size, step, 0, 3) # DI_NORMAL
+                        buffer = ctypes.create_string_buffer(size_x * size_y * 4)
+                        gdi32.GetDIBits(hdc, int(hbitmap), 0, size_y, buffer, ctypes.byref(bmi), 0)
+                        return np.frombuffer(buffer, dtype=np.uint8).reshape((size_y, size_x, 4))[..., :3][..., ::-1].astype(np.int32)
+
+                    # 1. Draw on Black background, 2. Draw on White background
+                    img_black = draw_on(4) # BLACK_BRUSH
+                    img_white = draw_on(0) # WHITE_BRUSH
+                    win32gui.SelectObject(hdc_mem, old_bmp)
+                finally:
+                    win32gui.DeleteObject(hbitmap)
+            finally:
+                win32gui.DeleteDC(hdc_mem)
+        finally:
+            win32gui.ReleaseDC(0, hdc)
+
+        if has_alpha:
+            # 3. Calculate Alpha
+            alpha = 255 - (img_white - img_black)
+            alpha = np.mean(alpha, axis=2)
+            alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+            # Only pixels with alpha > 1% are drawn.
+            visible = alpha > 2.55
+        else:
+            # Black background shows the XOR image; white background shows AND ^ XOR.
+            and_bits = (img_white ^ img_black).astype(np.uint8)
+            xor_bits = img_black.astype(np.uint8)
+            visible = ((and_bits != 255) | (xor_bits != 0)).any(axis=2)
+
+        # Crop to the visible bounding box.
+        rows = np.flatnonzero(visible.any(axis=1))
+        cols = np.flatnonzero(visible.any(axis=0))
+        if rows.size == 0:
+            return None
+        top, bottom = rows[0], rows[-1] + 1
+        left, right = cols[0], cols[-1] + 1
+        box = (slice(top, bottom), slice(left, right))
+        cursor = {
+            "offset_x": int(left) - int(hotspot_x),
+            "offset_y": int(top) - int(hotspot_y),
+            "mask": visible[box][..., None],
+            "has_alpha": has_alpha,
+        }
+        if has_alpha:
+            cursor["inv_alpha"] = (1.0 - alpha[box] / 255.0)[..., None]
+            cursor["rgb"] = np.clip(img_black, 0, 255).astype(np.uint8)[box]
+        else:
+            cursor["and_bits"] = and_bits[box]
+            cursor["xor_bits"] = xor_bits[box]
+        return cursor
+
+    def _get_frame_timing(self, hcursor, now):
+        """Returns the per-frame durations (seconds) of an animated cursor, or None."""
+        entry = self._frame_timing.get(hcursor)
+        if entry is None or now - entry[0] > self.CACHE_TTL:
+            durations = None
+            if _GetCursorFrameInfo is not None:
+                rate = ctypes.wintypes.DWORD()
+                steps = ctypes.wintypes.DWORD()
+                try:
+                    if _GetCursorFrameInfo(hcursor, 0, 0, ctypes.byref(rate), ctypes.byref(steps)) and steps.value > 1:
+                        durations = []
+                        for step in range(steps.value):
+                            _GetCursorFrameInfo(hcursor, 0, step, ctypes.byref(rate), ctypes.byref(steps))
+                            durations.append(rate.value * self.JIFFY)
+                        if sum(durations) <= 0:
+                            durations = None
+                except Exception:
+                    durations = None
+            if len(self._frame_timing) >= self.MAX_CACHE_ENTRIES:
+                self._frame_timing.clear()
+            entry = (now, durations)
+            self._frame_timing[hcursor] = entry
+        return entry[1]
+
+    def _current_step(self, hcursor, now):
+        durations = self._get_frame_timing(hcursor, now)
+        if not durations:
+            return 0
+        t = now % sum(durations)
+        for step, duration in enumerate(durations):
+            if t < duration:
+                return step
+            t -= duration
+        return len(durations) - 1
+
+    def _get_cursor(self, hcursor):
+        now = time.monotonic()
+        render_handle, draw_size = self._resolve_render_source(hcursor, now)
+        key = (render_handle, self._current_step(render_handle, now), draw_size)
+        entry = self._cache.get(key)
+        if entry is None or now - entry[0] > self.CACHE_TTL:
+            if len(self._cache) >= self.MAX_CACHE_ENTRIES:
+                self._cache.clear()
+            entry = (now, self._render_cursor(*key))
+            self._cache[key] = entry
+        return entry[1]
+
+    def draw(self, img_array):
+        info = CURSORINFO()
+        info.cbSize = ctypes.sizeof(CURSORINFO)
+        if not (user32.GetCursorInfo(ctypes.byref(info)) and info.flags == 1):
+            return img_array
+        x, y = info.ptScreenPos.x, info.ptScreenPos.y
+        try:
+            cursor = self._get_cursor(info.hCursor)
+            if cursor is None:
+                return img_array
+
+            h, w = img_array.shape[:2]
+            x0 = x + cursor["offset_x"]
+            y0 = y + cursor["offset_y"]
+            ch, cw = cursor["mask"].shape[:2]
+            # Clip the cursor box to the frame.
+            src_x0, src_y0 = max(0, -x0), max(0, -y0)
+            src_x1, src_y1 = min(cw, w - x0), min(ch, h - y0)
+            if src_x0 >= src_x1 or src_y0 >= src_y1:
+                return img_array
+
+            src = (slice(src_y0, src_y1), slice(src_x0, src_x1))
+            region = img_array[y0 + src_y0:y0 + src_y1, x0 + src_x0:x0 + src_x1]
+            if cursor["has_alpha"]:
+                drawn = cursor["rgb"][src] + region * cursor["inv_alpha"][src]
+                drawn = np.clip(drawn, 0, 255).astype(np.uint8)
+            else:
+                drawn = (region & cursor["and_bits"][src]) ^ cursor["xor_bits"][src]
+            np.copyto(region, drawn, where=cursor["mask"][src])
+        except Exception as e:
+            print(f"Fallback cursor due to: {e}")
+            cv2.circle(img_array, (x, y), 5, (0, 0, 255), -1)
+        return img_array
 
 # Monkey-patch numpy fromstring for older soundcard versions
 if not hasattr(np, '_old_fromstring'):
@@ -336,6 +684,18 @@ def cleanup_old_recordings(config, exclude_paths=None, recordings_dir=None):
         for path in (exclude_paths or [])
         if path
     }
+    # Never prune the folders that hold an excluded file: the recording in
+    # progress may not exist on disk yet (PyAV creates it on the first write),
+    # so its date folder can look empty.
+    protected_dirs = set()
+    for path in excluded:
+        parent = os.path.dirname(path)
+        while parent and parent not in protected_dirs:
+            protected_dirs.add(parent)
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
 
     deleted_count = 0
     freed_bytes = 0
@@ -370,7 +730,8 @@ def cleanup_old_recordings(config, exclude_paths=None, recordings_dir=None):
                 safe_log(f"Retention cleanup could not delete {file_path}: {e}")
 
         # Prune date folders that are now empty (bottom-up, so nested folders die first).
-        if os.path.normcase(root) == os.path.normcase(recordings_dir):
+        normalized_root = os.path.normcase(os.path.abspath(root))
+        if normalized_root == os.path.normcase(recordings_dir) or normalized_root in protected_dirs:
             continue
         try:
             if not os.listdir(root):
@@ -465,86 +826,8 @@ class ScreenAudioRecorder:
     def record_video(self):
         global RUNNING
         comtypes.CoInitialize()
-        
-        def draw_cursor(img_array):
-            info = CURSORINFO()
-            info.cbSize = ctypes.sizeof(CURSORINFO)
-            if user32.GetCursorInfo(ctypes.byref(info)) and info.flags == 1:
-                hcursor = info.hCursor
-                x, y = info.ptScreenPos.x, info.ptScreenPos.y
-                
-                icon_info = ICONINFO()
-                if user32.GetIconInfo(hcursor, ctypes.byref(icon_info)):
-                    x -= icon_info.xHotspot
-                    y -= icon_info.yHotspot
-                    
-                    if icon_info.hbmMask:
-                        gdi32.DeleteObject(ctypes.c_void_p(icon_info.hbmMask))
-                    if icon_info.hbmColor:
-                        gdi32.DeleteObject(ctypes.c_void_p(icon_info.hbmColor))
-                
-                try:
-                    size_x = 128
-                    size_y = 128
-                    
-                    hdc = win32gui.GetDC(0)
-                    hdc_mem = win32gui.CreateCompatibleDC(hdc)
-                    hbitmap = win32gui.CreateCompatibleBitmap(hdc, size_x, size_y)
-                    old_bmp = win32gui.SelectObject(hdc_mem, hbitmap)
-                    
-                    # 1. Draw on Black background
-                    win32gui.FillRect(hdc_mem, (0, 0, size_x, size_y), win32gui.GetStockObject(4)) # BLACK_BRUSH
-                    win32gui.DrawIconEx(hdc_mem, 0, 0, hcursor, 0, 0, 0, 0, 3) # DI_NORMAL
-                    
-                    bmi = BITMAPINFO()
-                    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-                    bmi.bmiHeader.biWidth = size_x
-                    bmi.bmiHeader.biHeight = -size_y # Top-down
-                    bmi.bmiHeader.biPlanes = 1
-                    bmi.bmiHeader.biBitCount = 32
-                    bmi.bmiHeader.biCompression = 0
-                    
-                    buffer_black = ctypes.create_string_buffer(size_x * size_y * 4)
-                    gdi32.GetDIBits(hdc, int(hbitmap), 0, size_y, buffer_black, ctypes.byref(bmi), 0)
-                    img_black = np.frombuffer(buffer_black, dtype=np.uint8).reshape((size_y, size_x, 4))[..., :3][..., ::-1].astype(np.int32)
-                    
-                    # 2. Draw on White background
-                    win32gui.FillRect(hdc_mem, (0, 0, size_x, size_y), win32gui.GetStockObject(0)) # WHITE_BRUSH
-                    win32gui.DrawIconEx(hdc_mem, 0, 0, hcursor, 0, 0, 0, 0, 3)
-                    
-                    buffer_white = ctypes.create_string_buffer(size_x * size_y * 4)
-                    gdi32.GetDIBits(hdc, int(hbitmap), 0, size_y, buffer_white, ctypes.byref(bmi), 0)
-                    img_white = np.frombuffer(buffer_white, dtype=np.uint8).reshape((size_y, size_x, 4))[..., :3][..., ::-1].astype(np.int32)
-                    
-                    # 3. Calculate Alpha
-                    alpha = 255 - (img_white - img_black)
-                    alpha = np.mean(alpha, axis=2)
-                    alpha = np.clip(alpha, 0, 255).astype(np.uint8)
-                    
-                    cursor_rgb = np.clip(img_black, 0, 255).astype(np.uint8)
-                    
-                    h, w = img_array.shape[:2]
-                    for cy in range(size_y):
-                        for cx in range(size_x):
-                            if y + cy < 0 or y + cy >= h or x + cx < 0 or x + cx >= w:
-                                continue
-                            
-                            alpha_val = alpha[cy, cx] / 255.0
-                            if alpha_val > 0.01:
-                                curr_bgr = img_array[y + cy, x + cx]
-                                cursor_bgr = cursor_rgb[cy, cx]
-                                new_bgr = cursor_bgr + curr_bgr * (1.0 - alpha_val)
-                                img_array[y + cy, x + cx] = np.clip(new_bgr, 0, 255).astype(np.uint8)
-                    
-                    win32gui.SelectObject(hdc_mem, old_bmp)
-                    win32gui.DeleteObject(hbitmap)
-                    win32gui.DeleteDC(hdc_mem)
-                    win32gui.ReleaseDC(0, hdc)
-                except Exception as e:
-                    print(f"Fallback cursor due to: {e}")
-                    cv2.circle(img_array, (x, y), 5, (0, 0, 255), -1)
-            return img_array
 
+        cursor_overlay = CursorOverlay()
         camera = dxcam.create(output_idx=0, output_color="RGB")
         camera.start(target_fps=self.fps, video_mode=True)
         
@@ -566,8 +849,15 @@ class ScreenAudioRecorder:
                     time.sleep(0.005)
                     continue
                     
-                img_with_cursor = draw_cursor(img.copy())
-                img_resized = cv2.resize(img_with_cursor, (self.width, self.height))
+                # dxcam >= 0.3 already returns a private copy; older versions return a
+                # view into their ring buffer, which must not be drawn on.
+                if img.base is not None:
+                    img = img.copy()
+                img_with_cursor = cursor_overlay.draw(img)
+                if img_with_cursor.shape[1] == self.width and img_with_cursor.shape[0] == self.height:
+                    img_resized = img_with_cursor
+                else:
+                    img_resized = cv2.resize(img_with_cursor, (self.width, self.height))
                 
                 frame = av.VideoFrame.from_ndarray(img_resized, format='rgb24')
                 
@@ -591,6 +881,7 @@ class ScreenAudioRecorder:
                     time.sleep(sleep_time)
         finally:
             camera.stop()
+            cursor_overlay.close()
                 
     def record_audio(self):
         global RUNNING
