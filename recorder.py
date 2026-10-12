@@ -828,12 +828,19 @@ class ScreenAudioRecorder:
         comtypes.CoInitialize()
 
         cursor_overlay = CursorOverlay()
-        camera = dxcam.create(output_idx=0, output_color="RGB")
-        camera.start(target_fps=self.fps, video_mode=True)
-        
+        camera = None
+        last_camera_error = None
+        camera_retry_at = 0.0
+
+        def release_camera(cam):
+            try:
+                cam.release()
+            except Exception:
+                pass
+
         self.start_event.wait(timeout=10)
         self.video_start_time = time.time()
-        
+
         try:
             while RUNNING:
                 with self.pause_lock:
@@ -841,6 +848,34 @@ class ScreenAudioRecorder:
                 if currently_paused:
                     time.sleep(0.1)
                     continue
+
+                # Desktop Duplication is denied while the secure desktop (lock screen,
+                # UAC prompt, sign-in) is active, and dxcam's own capture thread can
+                # die on unrecoverable errors. Keep retrying instead of letting the
+                # video thread crash while audio carries on alone.
+                if camera is not None and not camera.is_capturing:
+                    safe_log("Screen capture stopped unexpectedly; reinitializing...")
+                    release_camera(camera)
+                    camera = None
+                if camera is None:
+                    if time.time() < camera_retry_at:
+                        time.sleep(0.1)
+                        continue
+                    try:
+                        camera = dxcam.create(output_idx=0, output_color="RGB")
+                        camera.start(target_fps=self.fps, video_mode=True)
+                        if last_camera_error is not None:
+                            safe_log("Screen capture available again; resuming video.")
+                        last_camera_error = None
+                    except Exception as e:
+                        if camera is not None:
+                            release_camera(camera)
+                            camera = None
+                        if str(e) != last_camera_error:
+                            safe_log(f"Screen capture unavailable, retrying every 2s: {e}")
+                            last_camera_error = str(e)
+                        camera_retry_at = time.time() + 2.0
+                        continue
 
                 start_time = time.time()
                 img = camera.get_latest_frame()
@@ -880,7 +915,8 @@ class ScreenAudioRecorder:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
         finally:
-            camera.stop()
+            if camera is not None:
+                release_camera(camera)
             cursor_overlay.close()
                 
     def record_audio(self):
