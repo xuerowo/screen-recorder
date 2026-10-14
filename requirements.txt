@@ -4,4 +4,4 @@ opencv-python>=4.8.0
 soundcard>=0.4.2
 av>=11.0.0
 pypiwin32>=223
-dxcam>=0.0.5
+dxcam>=0.3.0
